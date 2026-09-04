@@ -1,13 +1,21 @@
 # .github/workflows/deploy.yml
 name: LLM Infra Pipeline
+
 on:
   workflow_dispatch:
     inputs:
-      action:
-        description: 'Terraform/Helm action'
+      stage:
+        description: 'Pipeline stage to run'
         required: true
         type: choice
-        options: [apply, destroy]
+        options:
+          - full-deploy
+          - provision-infra
+          - install-observability
+          - deploy-vllm
+          - load-test
+          - chaos-test
+          - destroy
 
 permissions:
   id-token: write
@@ -19,81 +27,133 @@ env:
   TF_DIR: terraform
 
 jobs:
-  infra:
+  provision-infra:
+    if: contains(fromJSON('["full-deploy","provision-infra"]'), inputs.stage)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Configure AWS Credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-oidc-llm-infra
           aws-region: ${{ env.AWS_REGION }}
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.9.0
-
-      - name: Terraform Init
-        working-directory: ${{ env.TF_DIR }}
+      - working-directory: ${{ env.TF_DIR }}
         run: terraform init
-
-      - name: Terraform Apply
-        if: github.event.inputs.action == 'apply'
-        working-directory: ${{ env.TF_DIR }}
+      - working-directory: ${{ env.TF_DIR }}
         run: terraform apply -auto-approve
 
-      - name: Update kubeconfig
-        if: github.event.inputs.action == 'apply'
-        run: aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
-
-      - name: Install Helm
-        if: github.event.inputs.action == 'apply'
-        uses: azure/setup-helm@v4
+  install-observability:
+    needs: provision-infra
+    if: |
+      always() &&
+      contains(fromJSON('["full-deploy","install-observability"]'), inputs.stage) &&
+      (needs.provision-infra.result == 'success' || needs.provision-infra.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-oidc-llm-infra
+          aws-region: ${{ env.AWS_REGION }}
+      - run: aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+      - uses: azure/setup-helm@v4
         with:
           version: v3.15.0
-
-      - name: Install NVIDIA Device Plugin
-        if: github.event.inputs.action == 'apply'
-        run: |
-          kubectl apply -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.16.1/deployments/static/nvidia-device-plugin.yml
-
-      - name: Install DCGM Exporter
-        if: github.event.inputs.action == 'apply'
+      - name: NVIDIA Device Plugin
+        run: kubectl apply -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.16.1/deployments/static/nvidia-device-plugin.yml
+      - name: DCGM Exporter
         run: |
           helm repo add gpu-helm-charts https://nvidia.github.io/dcgm-exporter/helm-charts
           helm repo update
           helm upgrade --install dcgm-exporter gpu-helm-charts/dcgm-exporter \
-            -n monitoring --create-namespace \
-            -f k8s/dcgm-exporter-values.yaml
-
-      - name: Install kube-prometheus-stack
-        if: github.event.inputs.action == 'apply'
+            -n monitoring --create-namespace -f k8s/dcgm-exporter-values.yaml
+      - name: kube-prometheus-stack
         run: |
           helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
           helm repo update
           helm upgrade --install kps prometheus-community/kube-prometheus-stack \
-            -n monitoring --create-namespace \
-            -f k8s/prometheus-stack-values.yaml
+            -n monitoring --create-namespace -f k8s/prometheus-stack-values.yaml
 
-      - name: Deploy vLLM
-        if: github.event.inputs.action == 'apply'
+  deploy-vllm:
+    needs: install-observability
+    if: |
+      always() &&
+      contains(fromJSON('["full-deploy","deploy-vllm"]'), inputs.stage) &&
+      (needs.install-observability.result == 'success' || needs.install-observability.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-oidc-llm-infra
+          aws-region: ${{ env.AWS_REGION }}
+      - run: aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+      - name: Create HF secret
         run: |
           kubectl create secret generic hf-token \
             --from-literal=HUGGING_FACE_HUB_TOKEN=${{ secrets.HF_TOKEN }} \
             --dry-run=client -o yaml | kubectl apply -f -
-          kubectl apply -f k8s/vllm-deployment.yaml
+      - name: Deploy vLLM
+        run: kubectl apply -f k8s/vllm-deployment.yaml
+      - name: Wait for rollout
+        run: kubectl rollout status deployment/vllm-deployment --timeout=600s
 
-      - name: Helm Uninstall (destroy path)
-        if: github.event.inputs.action == 'destroy'
+  load-test:
+    if: inputs.stage == 'load-test'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-oidc-llm-infra
+          aws-region: ${{ env.AWS_REGION }}
+      - run: aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+      - name: Port-forward vLLM service
+        run: kubectl port-forward svc/vllm-service 8000:8000 &
+      - name: Wait for port-forward
+        run: sleep 5
+      - uses: grafana/setup-k6-action@v1
+      - name: Run k6 load test
+        run: k6 run scripts/k6-load-test.js
+        env:
+          VLLM_URL: http://localhost:8000/v1/chat/completions
+
+  chaos-test:
+    if: inputs.stage == 'chaos-test'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-oidc-llm-infra
+          aws-region: ${{ env.AWS_REGION }}
+      - run: aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+      - name: Run chaos scenarios
         run: |
-          aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }} || true
+          chmod +x scripts/chaos-scenarios.sh
+          ./scripts/chaos-scenarios.sh
+
+  destroy:
+    if: inputs.stage == 'destroy'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-oidc-llm-infra
+          aws-region: ${{ env.AWS_REGION }}
+      - run: aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }} || true
+      - name: Helm uninstall
+        run: |
           helm uninstall kps -n monitoring || true
           helm uninstall dcgm-exporter -n monitoring || true
           kubectl delete -f k8s/vllm-deployment.yaml || true
-
-      - name: Terraform Destroy
-        if: github.event.inputs.action == 'destroy'
-        working-directory: ${{ env.TF_DIR }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.0
+      - working-directory: ${{ env.TF_DIR }}
+        run: terraform init
+      - working-directory: ${{ env.TF_DIR }}
         run: terraform destroy -auto-approve
