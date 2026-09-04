@@ -1,0 +1,25 @@
+# k8s/dcgm-exporter-values.yaml
+serviceMonitor:
+  enabled: true
+  interval: 15s
+  namespace: monitoring
+
+tolerations:
+  - key: "nvidia.com/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"
+
+nodeSelector:
+  nvidia.com/gpu.present: "true"
+
+resources:
+  limits:
+    cpu: 200m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+arguments:
+  - "-f"
+  - "/etc/dcgm-exporter/dcp-metrics-included.csv"
