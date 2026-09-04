@@ -24,15 +24,16 @@ spec:
       containers:
         - name: vllm
           image: vllm/vllm-openai:latest
+          # k8s/vllm-deployment.yaml (updated args block only)
           args:
             - "--model"
-            - "mistralai/Mistral-7B-Instruct-v0.3"
+            - "meta-llama/Llama-3.2-3B-Instruct"
             - "--dtype"
             - "float16"
             - "--max-model-len"
-            - "4096"
+            - "8192"
             - "--gpu-memory-utilization"
-            - "0.9"
+            - "0.85"
             - "--port"
             - "8000"
           ports:
