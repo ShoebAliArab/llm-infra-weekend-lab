@@ -25,7 +25,7 @@ resource "aws_eks_node_group" "gpu" {
   scaling_config {
     min_size     = 0
     max_size     = 2
-    desired_size = 0
+    desired_size = 2
   }
 
   ami_type = "AL2_x86_64_GPU"
