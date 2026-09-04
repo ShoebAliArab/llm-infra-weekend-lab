@@ -1,0 +1,99 @@
+# .github/workflows/deploy.yml
+name: LLM Infra Pipeline
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Terraform/Helm action'
+        required: true
+        type: choice
+        options: [apply, destroy]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: llm-infra-weekend
+  TF_DIR: terraform
+
+jobs:
+  infra:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-oidc-llm-infra
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.0
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init
+
+      - name: Terraform Apply
+        if: github.event.inputs.action == 'apply'
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform apply -auto-approve
+
+      - name: Update kubeconfig
+        if: github.event.inputs.action == 'apply'
+        run: aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+      - name: Install Helm
+        if: github.event.inputs.action == 'apply'
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.15.0
+
+      - name: Install NVIDIA Device Plugin
+        if: github.event.inputs.action == 'apply'
+        run: |
+          kubectl apply -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.16.1/deployments/static/nvidia-device-plugin.yml
+
+      - name: Install DCGM Exporter
+        if: github.event.inputs.action == 'apply'
+        run: |
+          helm repo add gpu-helm-charts https://nvidia.github.io/dcgm-exporter/helm-charts
+          helm repo update
+          helm upgrade --install dcgm-exporter gpu-helm-charts/dcgm-exporter \
+            -n monitoring --create-namespace \
+            -f k8s/dcgm-exporter-values.yaml
+
+      - name: Install kube-prometheus-stack
+        if: github.event.inputs.action == 'apply'
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+          helm upgrade --install kps prometheus-community/kube-prometheus-stack \
+            -n monitoring --create-namespace \
+            -f k8s/prometheus-stack-values.yaml
+
+      - name: Deploy vLLM
+        if: github.event.inputs.action == 'apply'
+        run: |
+          kubectl create secret generic hf-token \
+            --from-literal=HUGGING_FACE_HUB_TOKEN=${{ secrets.HF_TOKEN }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl apply -f k8s/vllm-deployment.yaml
+
+      - name: Helm Uninstall (destroy path)
+        if: github.event.inputs.action == 'destroy'
+        run: |
+          aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }} || true
+          helm uninstall kps -n monitoring || true
+          helm uninstall dcgm-exporter -n monitoring || true
+          kubectl delete -f k8s/vllm-deployment.yaml || true
+
+      - name: Terraform Destroy
+        if: github.event.inputs.action == 'destroy'
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform destroy -auto-approve
