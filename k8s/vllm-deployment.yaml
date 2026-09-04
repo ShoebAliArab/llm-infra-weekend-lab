@@ -1,0 +1,70 @@
+# k8s/vllm-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-deployment
+  labels:
+    app: vllm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+    spec:
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:latest
+          args:
+            - "--model"
+            - "mistralai/Mistral-7B-Instruct-v0.3"
+            - "--dtype"
+            - "float16"
+            - "--max-model-len"
+            - "4096"
+            - "--gpu-memory-utilization"
+            - "0.9"
+            - "--port"
+            - "8000"
+          ports:
+            - containerPort: 8000
+          env:
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HUGGING_FACE_HUB_TOKEN
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+            requests:
+              nvidia.com/gpu: 1
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-service
+spec:
+  selector:
+    app: vllm
+  ports:
+    - port: 8000
+      targetPort: 8000
+  type: ClusterIP
